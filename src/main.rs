@@ -34,10 +34,10 @@ fn main() -> Result<()> {
             for dev in Device::list()? {
                 println!("- {}: {}", dev.name, dev.desc.unwrap_or_default());
             }
-            return ok(());
+            return Ok(());
         }
     };
-    println!("Capturing on device {}", device name);
+    println!("Capturing on device {}", device.name);
 
     //CAPTURE HANDLE WITH SOME CONFIGURATIONS
     let mut cap = Capture::from_device(device)?
@@ -54,7 +54,7 @@ fn main() -> Result<()> {
             Ok(packet) => {
                 packet_count += 1;
 
-                orintln!("\n[Packet #{}] {} bytes", packet_count, packet.header.len);
+                println!("\n[Packet #{}] {} bytes", packet_count, packet.header.len);
 
                 match SlicedPacket::from_ethernet(packet.data) {
                     Ok(value) => analyze_packet(value),
@@ -102,8 +102,8 @@ fn main() -> Result<()> {
     //analyze transport layer
     match &packet.transport {
         Some(TransportSlice::Tcp(tcp)) => {
-            println!("TCP: Port {} -> {}", tcp.source_port(), tcp.destintion_port());
-            println!("Flags: SYN={} ACK{} FIN{} RST{}",
+            println!("TCP: Port {} -> {}", tcp.source_port(), tcp.destination_port());
+            println!("Flags: SYN={} ACK={} FIN={} RST={}",
                 tcp.syn(), tcp.ack(), tcp.fin(), tcp.rst());
             println!("Sequence: {}, Window: {}", tcp.sequence_number(), tcp.window_size());
         }
