@@ -6,6 +6,6 @@ edition = "2024"
 [dependencies]
 pcap = "1.1.0"  # capturing packets
 etherparse = "0.13.0"   # parsing packet contents
-clap = { version = "4.3", features = ["derive] }    # command-line args
-anyhow = "1.0"  # error handling
+clap = { version = "4.3", features = ["derive"] }    # command-line args
+anyhow = "1.0"   # error handling
 
