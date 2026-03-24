@@ -10,6 +10,9 @@ use chrono::Local;
 use serde::{Serialize, Deserialize};
 use std::fs::File;
 use std::io::Write;
+use std::collections::HashMap;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 /// CLI ARGUMENTS 
 
@@ -44,6 +47,10 @@ struct Args {
     /// Print each packet as JSON to stdout
     #[arg(long, default_value_t = false)]
     json: bool,
+
+    /// Show traffic statistics summary at end of session
+    #[arg(long, default_value_t = false)]
+    stats: bool,
 }
 
 /// Data Structures
@@ -63,6 +70,115 @@ struct PacketRecord {
     payload_preview: String,
 }
 
+#[derive(Debug, Default)]
+struct Stats {
+    total_packets: usize,
+    total_bytes: u64,
+    tcp_count: usize,
+    udp_count: usize,
+    icmp_count: usize,
+    dns_count: usize,
+    http_count: usize,
+    src_ips: HashMap<String, usize>,
+    dst_ips: HashMap<String, usize>,
+    src_ports: HashMap<u16, usize>,
+    dst_ports: HashMap<u16, usize>,
+}
+
+impl Stats {
+    fn new() -> Self {
+        Self::default()
+    }
+    fn update(&mut self, record: &PacketRecord, src_port: u16, dst_port: u16) {
+        self.total_packets += 1;
+        self.total_bytes += record.bytes as u64;
+
+        if let Some(ref t) = record.transport {
+            match t.as_str() {
+                "TCP"   => self.tcp_count += 1,
+                "UDP"   => self.udp_count += 1,
+                "ICMPv4" | "ICMPv6" => self.icmp_count += 1,
+                _ => {}
+            }
+        }
+
+        // Count DNS and HTTP by port
+        if src_port == 53 || dst_port == 53 {
+            self.dns_count += 1;
+        }
+        if src_port == 80 || dst_port == 80 || src_port == 8080 || dst_port == 8080 {
+            self.http_count += 1;
+        }
+
+        if let Some(ref ip) = record.src_ip {
+            *self.src_ips.entry(ip.clone()).or_insert(0) += 1;
+        }
+        if let Some(ref ip) = record.dst_ip {
+            *self.dst_ips.entry(ip.clone()).or_insert(0) += 1;
+        }
+
+        if src_port > 0 {
+            *self.src_ports.entry(src_port).or_insert(0) += 1;
+        }
+        if dst_port > 0 {
+            *self.dst_ports.entry(dst_port).or_insert(0) += 1;
+        }
+    }
+
+    fn print_summary(&self) {
+        println!("\n{}", "═".repeat(60).cyan());
+        println!("{}", "  CAPTURE SUMMARY".bold().cyan());
+        println!("{}", "═".repeat(60).cyan());
+
+        println!(
+            "  {}  {}    {}  {}",
+            "Total Packets:".bold(), self.total_packets,
+            "Total Bytes:".bold(), self.total_bytes
+        );
+
+        println!("\n  {}", "Protocol Breakdown:".bold());
+        println!("  TCP:    {}", self.tcp_count.to_string().cyan());
+        println!("  UDP:    {}", self.udp_count.to_string().yellow());
+        println!("  ICMP:   {}", self.icmp_count.to_string().red());
+        println!("  DNS:    {}", self.dns_count.to_string().magenta());
+        println!("  HTTP:   {}", self.http_count.to_string().green());
+
+        // Top 5 source IPs
+        println!("\n  {}", "Top Source IPs:".bold());
+        let mut src_ips: Vec<_> = self.src_ips.iter().collect();
+        src_ips.sort_by(|a, b| b.1.cmp(a.1));
+        for (ip, count) in src_ips.iter().take(5) {
+            println!("  {:>5}  {}", count.to_string().white(), ip.cyan());
+        }
+
+        // Top 5 destination IPs
+        println!("\n  {}", "Top Destination IPs:".bold());
+        let mut dst_ips: Vec<_> = self.dst_ips.iter().collect();
+        dst_ips.sort_by(|a, b| b.1.cmp(a.1));
+        for (ip, count) in dst_ips.iter().take(5) {
+            println!("  {:>5}  {}", count.to_string().white(), ip.cyan());
+        }
+
+        //Top source ports
+        println!("\n  {}", "Top Source Ports:".bold());
+        let mut src_ports: Vec<_> = self.src_ports.iter().collect();
+        src_ports.sort_by(|a, b| b.1.cmp(a.1));
+        for (port, count) in src_ports.iter().take(5) {
+            println!("  {:>5}  port {}", count.to_string().white(), port.to_string().yellow());
+        }
+
+        // Top 5 destination ports
+        println!("\n  {}", "Top Destination Ports:".bold());
+        let mut dst_ports: Vec<_> = self.dst_ports.iter().collect();
+        dst_ports.sort_by(|a, b| b.1.cmp(a.1));
+        for (port, count) in dst_ports.iter().take(5) {
+            println!("  {:>5}  port {}", count.to_string().white(), port.to_string().yellow());
+        }
+
+        println!("{}", "═".repeat(60).cyan());
+    }
+}
+
 ///  MAIN 
 
 fn main() -> Result<()> {
@@ -71,6 +187,14 @@ fn main() -> Result<()> {
     if args.no_color {
         colored::control::set_override(false);
     }
+
+    // Ctrl+c handler
+     let running = Arc::new(AtomicBool::new(true));
+    let r = running.clone();
+    ctrlc::set_handler(move || {
+        r.store(false, Ordering::SeqCst);
+    }).expect("Error setting Ctrl+C handler");
+
 
     let device = match &args.interface {
         Some(interface_name) => {
@@ -134,6 +258,8 @@ fn main() -> Result<()> {
     // ── Capture loop ──────────────────────────────────────────────────────────
     let mut packet_count = 0;
     let mut json_records: Vec<PacketRecord> = Vec::new();
+    let mut stats = Stats::new();
+    let show_stats = args.stats || args.count == 0;
 
     while args.count == 0 || packet_count < args.count {
         match cap.next_packet() {
@@ -162,10 +288,18 @@ fn main() -> Result<()> {
                             &sliced,
                         );
 
+                         // Extract ports for stats before consuming sliced
+                        let src_port = record.src_port.unwrap_or(0);
+                        let dst_port = record.dst_port.unwrap_or(0);
+
                         analyze_packet(sliced);
 
                         if args.json {
                             println!("{}", serde_json::to_string_pretty(&record)?);
+                        }
+
+                        if show_stats {
+                            stats.update(&record, src_port, dst_port);
                         }
 
                         json_records.push(record);
@@ -189,6 +323,11 @@ fn main() -> Result<()> {
         }
         writeln!(f, "]")?;
         println!("{}", "JSON file written successfully.".green().bold());
+    }
+
+    //Print stats summary
+    if show_stats {
+        stats.print_summary();
     }
 
     Ok(())
