@@ -7,6 +7,9 @@ use std::net::Ipv6Addr;
 use anyhow::{Context, Result};
 use colored::*;
 use chrono::Local;
+use serde::{Serialize, Deserialize};
+use std::fs::File;
+use std::io::Write;
 
 /// CLI ARGUMENTS 
 
@@ -29,6 +32,35 @@ struct Args {
      /// Disable colored output (useful when piping to a file)
     #[arg(long, default_value_t = false)]
     no_color: bool,
+
+    /// Save capture to a .pcap file e.g --pcap-out capture.pcap
+    #[arg(long)]
+    pcap_out: Option<String>,
+
+    /// Save capture to a JSON file e.g --json-out capture.json
+    #[arg(long)]
+    json_out: Option<String>,
+
+    /// Print each packet as JSON to stdout
+    #[arg(long, default_value_t = false)]
+    json: bool,
+}
+
+/// Data Structures
+
+#[derive(Serialize, Deserialize, Debug)]
+struct PacketRecord {
+    number: usize,
+    timestamp: String,
+    bytes: u32,
+    src_ip: Option<String>,
+    dst_ip: Option<String>,
+    protocol: Option<String>,
+    src_port: Option<u16>,
+    dst_port: Option<u16>,
+    transport: Option<String>,
+    payload_bytes: usize,
+    payload_preview: String,
 }
 
 ///  MAIN 
@@ -50,7 +82,7 @@ fn main() -> Result<()> {
         None => {
             println!("Available network interfaces:");
             for dev in Device::list()? {
-                println!("- {}: {}", "→".cyan(), dev.name.green());
+                println!("  {} {}", "→".cyan(), dev.name.green());
             }
             return Ok(());
         }
@@ -64,22 +96,55 @@ fn main() -> Result<()> {
         .timeout(100)
         .open()?;
 
-    //  Apply BPF filter if provided 
     if let Some(filter_expr) = &args.filter {
         cap.filter(filter_expr, true)
-            .with_context(|| format!("Invalid BPF filter expression: '{}'", filter_expr))?;
+            .with_context(|| format!("Invalid BPF filter: '{}'", filter_expr))?;
         println!("{} {}", "Filter:".bold(), filter_expr.yellow());
     }
 
-    println!("{}", "_".repeat(60).dimmed());
+    // ── Open .pcap save file if requested ─────────────────────────────────────
+    let mut savefile = match &args.pcap_out {
+        Some(path) => {
+            let sf = cap.savefile(path.as_str())
+                .with_context(|| format!("Could not create pcap file: '{}'", path))?;
+            println!("{} {}", "Saving .pcap to:".bold(), path.green());
+            Some(sf)
+        }
+        None => None,
+    };
 
-    //  Capture loop 
+    // ── Open JSON output file if requested ────────────────────────────────────
+    let mut json_file: Option<File> = match &args.json_out {
+        Some(path) => {
+            let f = File::create(path)
+                .with_context(|| format!("Could not create JSON file: '{}'", path))?;
+            println!("{} {}", "Saving JSON to:".bold(), path.green());
+            Some(f)
+        }
+        None => None,
+    };
+
+    // Write JSON array opening bracket
+    if let Some(ref mut f) = json_file {
+        writeln!(f, "[")?;
+    }
+
+    println!("{}", "─".repeat(60).dimmed());
+
+    // ── Capture loop ──────────────────────────────────────────────────────────
     let mut packet_count = 0;
+    let mut json_records: Vec<PacketRecord> = Vec::new();
+
     while args.count == 0 || packet_count < args.count {
         match cap.next_packet() {
             Ok(packet) => {
                 packet_count += 1;
                 let timestamp = Local::now().format("%H:%M:%S%.3f").to_string();
+
+                if let Some(ref mut sf) = savefile {
+                    sf.write(&packet);
+                }
+
                 println!(
                     "\n{} {} {} {}",
                     format!("[#{}]", packet_count).bold().white(),
@@ -89,19 +154,113 @@ fn main() -> Result<()> {
                 );
 
                 match SlicedPacket::from_ethernet(packet.data) {
-                    Ok(value) => analyze_packet(value),
-                    Err(err) => println!("{} {:?}", "Error parsing packet:".red().bold(), err),
+                    Ok(sliced) => {
+                        let record = build_record(
+                            packet_count,
+                            &timestamp,
+                            packet.header.len,
+                            &sliced,
+                        );
+
+                        analyze_packet(sliced);
+
+                        if args.json {
+                            println!("{}", serde_json::to_string_pretty(&record)?);
+                        }
+
+                        json_records.push(record);
+                    }
+                    Err(err) => println!("{} {:?}", "Parse error:".red().bold(), err),
                 }
             }
             Err(pcap::Error::TimeoutExpired) => continue,
             Err(err) => {
-                println!("{} {:?}", "Error receiving packet:".red().bold(), err);
+                println!("{} {:?}", "Capture error:".red().bold(), err);
                 break;
             }
         }
     }
 
+    // ── Write JSON file ───────────────────────────────────────────────────────
+    if let Some(ref mut f) = json_file {
+        for (i, record) in json_records.iter().enumerate() {
+            let comma = if i < json_records.len() - 1 { "," } else { "" };
+            writeln!(f, "  {}{}", serde_json::to_string_pretty(record)?, comma)?;
+        }
+        writeln!(f, "]")?;
+        println!("{}", "JSON file written successfully.".green().bold());
+    }
+
     Ok(())
+}
+
+/// build packet record
+
+fn build_record(
+    number: usize,
+    timestamp: &str,
+    bytes: u32,
+    packet: &SlicedPacket,
+) -> PacketRecord {
+    let mut src_ip = None;
+    let mut dst_ip = None;
+    let mut protocol = None;
+
+    match &packet.ip {
+        Some(InternetSlice::Ipv4(ipv4, _)) => {
+            src_ip = Some(ipv4.source_addr().to_string());
+            dst_ip = Some(ipv4.destination_addr().to_string());
+            protocol = Some(format!("{}", ipv4.protocol()));
+        }
+        Some(InternetSlice::Ipv6(ipv6, _)) => {
+            src_ip = Some(Ipv6Addr::from(ipv6.source_addr()).to_string());
+            dst_ip = Some(Ipv6Addr::from(ipv6.destination_addr()).to_string());
+            protocol = Some(format!("{}", ipv6.next_header()));
+        }
+        None => {}
+    }
+
+    let mut src_port = None;
+    let mut dst_port = None;
+    let mut transport = None;
+
+    match &packet.transport {
+        Some(TransportSlice::Tcp(tcp)) => {
+            src_port = Some(tcp.source_port());
+            dst_port = Some(tcp.destination_port());
+            transport = Some("TCP".to_string());
+        }
+        Some(TransportSlice::Udp(udp)) => {
+            src_port = Some(udp.source_port());
+            dst_port = Some(udp.destination_port());
+            transport = Some("UDP".to_string());
+        }
+        Some(TransportSlice::Icmpv4(_)) => transport = Some("ICMPv4".to_string()),
+        Some(TransportSlice::Icmpv6(_)) => transport = Some("ICMPv6".to_string()),
+        _ => {}
+    }
+
+    let payload = &packet.payload;
+    let preview_len = std::cmp::min(16, payload.len());
+    let payload_preview = payload[0..preview_len]
+        .iter()
+        .map(|b| format!("{:02x}", b))
+        .collect::<Vec<_>>()
+        .join(" ");
+
+    PacketRecord {
+        number,
+        timestamp: timestamp.to_string(),
+        bytes,
+        src_ip,
+        dst_ip,
+        protocol,
+        src_port,
+        dst_port,
+        transport,
+        payload_bytes: payload.len(),
+        payload_preview,
+    }
 }
 
 ///  PACKET ANALYSIS 
