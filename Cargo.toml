@@ -1,6 +1,6 @@
 [package]
-name = "packet-sniffer"
-version = "0.1.0"
+name = "netsniff"
+version = "2.0.0"
 edition = "2024"
 
 [dependencies]
