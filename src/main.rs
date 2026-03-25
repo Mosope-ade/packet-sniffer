@@ -62,7 +62,7 @@ struct Args {
     protocol: Option<String>,
 
     /// Enable promiscuous mode (capture all packets on the network)
-    #[arg(long, default_value_t = false)]
+    #[arg(long, default_value_t = true)]
     promisc: bool,
 }
 
